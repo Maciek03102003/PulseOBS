@@ -1,5 +1,7 @@
 #include "heart_rate_algorithm.h"
 #include "plugin-support.h"
+#include "filtering/pre_filters.h"
+#include "filtering/post_filters.h"
 
 #include <obs-module.h>
 #include <fstream>
@@ -159,7 +161,7 @@ double MovingAvg::welch(vector<double_t> bvps)
 	int overlap = 200;
 
 	double frequencyResolution = (fps * 60.0) / numFrames;
-	int nyquistLimit = segmentSize / 2;
+	int nyquistLimit = fps / 2;
 
 	// Convert signal to Eigen array
 	ArrayXd signal = Eigen::Map<const ArrayXd>(bvps.data(), bvps.size());
@@ -263,11 +265,35 @@ Window concatWindows(Windows windows)
 	return concatenatedWindow;
 }
 
+double MovingAvg::smoothHeartRate(double hr)
+{
+	double meanHr = accumulate(heartRates.begin(), heartRates.end(), 0.0) / heartRates.size();
+
+	double varianceHr = 0.0;
+	cout << "Heart Rates:";
+	for (double hr : heartRates) {
+		cout << hr << ", ";
+		varianceHr += pow(hr - meanHr, 2);
+	}
+	varianceHr /= heartRates.size();
+
+	cout << endl << "Mean: " << meanHr << endl << "Var: " << varianceHr << endl;
+
+	double maxHr = meanHr + 3 * sqrt(varianceHr);
+	double minHr = meanHr - 3 * sqrt(varianceHr);
+
+	if (hr > maxHr) {
+		return maxHr;
+	} else if (hr < minHr) {
+		return minHr;
+	} else {
+		return hr;
+	}
+}
+
 double MovingAvg::calculateHeartRate(vector<double_t> avg, int preFilter, int ppg, int postFilter, int Fps,
-				     int sampleRate)
+				     int sampleRate, bool smooth)
 { // Assume frame in YUV format: struct obs_source_frame *source
-	UNUSED_PARAMETER(preFilter);
-	UNUSED_PARAMETER(postFilter);
 
 	fps = Fps;
 	windowSize = sampleRate * fps;
@@ -276,27 +302,49 @@ double MovingAvg::calculateHeartRate(vector<double_t> avg, int preFilter, int pp
 
 	vector<double_t> ppgSignal;
 
-	if (!windows.empty() && static_cast<int>(windows.back().size()) == windowSize) {
+	if (!windows.empty() && static_cast<int>(windows.back().size()) == windowSize &&
+	    static_cast<int>(windows.size()) >= calibrationTime) {
 		Window currentWindow = concatWindows(windows);
+
+		Window filteredWindow = applyPreFilter(currentWindow, preFilter, fps);
+
 		switch (ppg) {
 		case 0:
-			obs_log(LOG_INFO, "Current PPG Algorithm: Green channel");
-			ppgSignal = green(currentWindow);
+			ppgSignal = green(filteredWindow);
 			break;
 		case 1:
-			obs_log(LOG_INFO, "Current PPG Algorithm: PCA");
-			ppgSignal = pca(currentWindow);
+			ppgSignal = pca(filteredWindow);
 			break;
 		case 2:
-			obs_log(LOG_INFO, "Current PPG Algorithm: Chrom");
-			ppgSignal = chrom(currentWindow);
+			ppgSignal = chrom(filteredWindow);
 			break;
 		default:
 			break;
 		}
 
-		return welch(ppgSignal);
+		vector<double_t> filtered_ppg = applyPostFilter(ppgSignal, postFilter, fps);
+
+		double unsmoothedHeartRate = welch(ppgSignal);
+
+		if (smooth) {
+			if (static_cast<int>(heartRates.size()) < numHeartRates) {
+				heartRates.push_back(unsmoothedHeartRate);
+				return unsmoothedHeartRate;
+			} else {
+				double heartRate = smoothHeartRate(unsmoothedHeartRate);
+				heartRates.erase(heartRates.begin());
+				heartRates.push_back(unsmoothedHeartRate);
+
+				return heartRate;
+			}
+		}
+
+		return unsmoothedHeartRate;
+
 	} else {
+		if (static_cast<int>(windows.size()) < calibrationTime) {
+			return -1.0;
+		}
 		return 0.0;
 	}
 }
